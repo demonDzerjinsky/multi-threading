@@ -1,0 +1,1 @@
+Rule of thumb: reach for a coroutine when your instinct is to write a state machine, a callback chain, or an infinite while loop with a chunk of work per iteration — those are exactly what coroutines collapse into readable, linear code
