@@ -1,5 +1,7 @@
 # Coroutines
 
+Nodejs coroutines key difference from Lua's coroutines (your repo topic): Lua's are stackful — you can yield from deep inside nested calls, while JS's are stackless — only the async function itself can suspend; callers don't get paused.
+
 Rule of thumb: reach for a coroutine when your instinct is to write a state machine, a callback chain, or an infinite while loop with a chunk of work per iteration — those are exactly what coroutines collapse into readable, linear code
 
 # Coroutine Lifecycle
@@ -372,3 +374,79 @@ If an allocation fails, Lua runs an **emergency full collection** (`luaC_fullgc`
 ## TL;DR mental model
 
 > Lua is a **tracing, incremental/generational, tri-color mark-and-sweep GC** over a heap of **tagged 16-byte cells**, where numbers live inline and everything else is a reference to a GCObject allocated through one user-swappable allocator; strings are interned and immutable; tables are array+hash hybrid structures; upvalues are reference cells that get "closed" onto the heap; and finalization exists in two flavors — nondeterministic (`__gc`) and deterministic (`<close>`).
+
+# Non-Blocking IO with Coroutines + libuv
+
+File: `non_blocking_io_coroutines.lua` — non-blocking IO with plain coroutines and the `luv` module (the standalone Lua binding of libuv, the same library Neovim embeds as `vim.uv`). No frameworks — the whole async layer is ~30 lines, and the callback is the resumer.
+
+## The three primitives
+
+### `async(fn)` — start a coroutine
+
+```lua
+local function async(fn)
+  return function(...)
+    local ok, err = coroutine.resume(coroutine.create(fn), ...)
+    if not ok then error(err, 0) end
+  end
+end
+```
+
+Just `coroutine.create` + first `resume` — this is the same "first resume" path `coroutine.resume` takes internally: the body starts running on the coroutine's own stack.
+
+### `await(fn, ...)` — suspend until IO completes
+
+```lua
+local function await(fn, ...)
+  local co = coroutine.running()
+  fn(function(err, ...)
+    coroutine.resume(co, err, ...)   -- ← the libuv callback is the resumer
+  end, ...)
+  return coroutine.yield()           -- thread suspends here
+end
+```
+
+This is the heart of the pattern, and it is exactly what plenary's `wrap` + `await` do internally:
+
+1. Get a handle to the *currently running* coroutine (`coroutine.running`).
+2. Call the libuv function (`uv.fs_open`, `uv.fs_read`, ...) passing a **completion callback** instead of waiting.
+3. Immediately `coroutine.yield()` — the coroutine suspends, the main thread is free, control returns to whoever resumed this coroutine last.
+4. When the OS operation finishes, the event loop invokes the callback — and the callback calls `coroutine.resume(co, err, ...)`, which **is** the yield's return values. So `local err, data = await(uv.fs_read, ...)` looks blocking, but each line is actually a suspend/resume boundary.
+
+### `sleep(ms)` — a non-blocking timer
+
+Same pattern with `uv.new_timer`: start the timer, yield, and the timer callback resumes the coroutine. The main loop keeps running during the sleep — which is why the second demo coroutine can tick three times while the first one is "sleeping" and reading a file.
+
+## Driving the loop
+
+```lua
+uv.run()
+```
+
+Standalone `luv` does **not** run the event loop automatically (Neovim does it for you). `uv.run()` polls the OS for readiness and dispatches callbacks — every callback that fires here performs a `coroutine.resume`. The loop exits when no handles are left (or `uv.stop()` is called).
+
+## Why nothing blocks
+
+```
+main thread:   uv.run()  →  event loop dispatches callbacks  →  coroutine.resume(...)
+                                                            (never waits on IO)
+coroutine 1:   running ... yield(await) ... yield(await) ... resumed with results
+coroutine 2:   running ... yield(await) ... resumed ...
+```
+
+Both coroutines interleave: each one runs only between its own `await` boundaries, and each `await` releases the thread. The interleaving schedule is entirely determined by which IO operation completes first — there is no scheduler, you (via libuv's completion callbacks) are the resumer, exactly like in the producer/consumer examples in this repo.
+
+## How this maps to the coroutine lifecycle
+
+| Step in `await` | Lifecycle state |
+|---|---|
+| `coroutine.yield()` inside `await` | `running` → `suspended` |
+| libuv callback fires → `coroutine.resume(co, err, ...)` | `suspended` → `running`, resumer's `await` returns the values |
+| script body `error()` inside coroutine | `running` → `dead` (caught by the first `resume` in `async`) |
+| both coroutines done → no handles left | `uv.run()` returns |
+
+## Production-hardening notes
+
+- Uncaught errors inside resumed coroutines are silent (the second `coroutine.resume` in `await` discards `ok`). Real wrappers check the resume result and re-raise, or use `coroutine.wrap` for auto-propagation.
+- Error value placement: this script standardizes on luv's `(err, ...)` callback order and returns `(nil, err)` style results into the coroutine.
+- `await` assumes the callback fires exactly once — fine for libuv fs/timer, but any wrapper for a library that can call back multiple times needs a queue-based design.
