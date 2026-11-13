@@ -1,7 +1,6 @@
 # Coroutines
 
 Nodejs coroutines key difference from Lua's coroutines (your repo topic): Lua's are stackful — you can yield from deep inside nested calls, while JS's are stackless — only the async function itself can suspend; callers don't get paused.
-
 Rule of thumb: reach for a coroutine when your instinct is to write a state machine, a callback chain, or an infinite while loop with a chunk of work per iteration — those are exactly what coroutines collapse into readable, linear code
 
 # Coroutine Lifecycle
